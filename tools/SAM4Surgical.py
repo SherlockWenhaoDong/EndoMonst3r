@@ -10,7 +10,6 @@ import sys
 
 sys.path.append('/home/bygpu/sam3')
 
-# 🔧 强制完全离线模式
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
@@ -18,7 +17,6 @@ os.environ['HF_DATASETS_OFFLINE'] = '1'
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-# 🔧 只调整这个置信度阈值 - 范围 0-1，值越大要求越严格
 CONFIDENCE_THRESHOLD = 0.05
 
 
@@ -122,13 +120,11 @@ def process_folder_for_non_human_tissues(folder_path, mask_output_dir=None, visu
             all_boxes = []
             all_scores = []
 
-            # 🔧 只使用 "tools" 提示词
             try:
                 print("  🔍 Using prompt: 'tools'")
                 output = processor.set_text_prompt(state=inference_state, prompt="tools")
 
                 if output["masks"] is not None and len(output["masks"]) > 0:
-                    # 🔧 应用置信度阈值过滤
                     initial_objects = len(output["masks"])
                     passed_objects = 0
 
