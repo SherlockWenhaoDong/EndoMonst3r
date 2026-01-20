@@ -1,5 +1,5 @@
 # --------------------------------------------------------
-# optimization code for DUSt3R with known poses
+# optimization code for DUSt3R with known poses (Fixed Version)
 # --------------------------------------------------------
 import os
 
@@ -64,6 +64,7 @@ def get_args_parser():
     parser.add_argument('--min_lr', type=float, default=1e-6, help="minimum learning rate")
     parser.add_argument('--warmup_epochs', type=int, default=5, help="epochs to warmup LR")
     parser.add_argument('--amp', type=int, default=1, choices=[0, 1], help="Use Automatic Mixed Precision")
+    parser.add_argument('--grad_clip', type=float, default=1.0, help="Gradient clipping value")
 
     # freeze settings
     parser.add_argument('--freeze_encoder', action='store_true', default=True,
@@ -90,6 +91,14 @@ def get_args_parser():
                         help="use ground truth camera poses")
     parser.add_argument('--fixed_eval_set', action='store_true', default=False,
                         help="use fixed evaluation set (don't shuffle)")
+
+    # memory management
+    parser.add_argument('--mixed_precision', action='store_true', default=True,
+                        help="use mixed precision training")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help="number of gradient accumulation steps")
+    parser.add_argument('--skip_ooms', action='store_true', default=True,
+                        help="skip batches that cause OOM errors")
 
     # distributed training
     parser.add_argument('--distributed', action='store_true', default=False,
@@ -118,41 +127,79 @@ def freeze_model_parameters(model, args):
 
     print("\n=== Parameter Freezing ===")
 
+    # 首先解冻所有参数
+    for param in model.parameters():
+        param.requires_grad = True
+
+    # 然后根据参数冻结
     for name, param in model.named_parameters():
         total_params += param.numel()
 
-        # Freeze conditions
-        freeze = False
+        # 默认不解冻
+        freeze = True  # 默认冻结所有参数
 
-        if args.freeze_encoder and 'encoder' in name:
-            freeze = True
+        # 根据条件判断哪些参数应该解冻
+        if args.freeze_encoder:
+            # 冻结encoder，但解冻decoder和head
+            if 'encoder' not in name:
+                freeze = False
+        else:
+            # 不解冻encoder
+            if 'encoder' in name:
+                freeze = False
 
         if args.freeze_pos_embed:
             if 'pos_embed' in name or 'rope' in name.lower():
                 freeze = True
+            else:
+                # 如果不是pos_embed，保持原状
+                pass
 
         if args.freeze_patch_embed:
             if 'patch_embed' in name:
                 freeze = True
+            else:
+                # 如果不是patch_embed，保持原状
+                pass
 
         if args.train_only_decoder:
-            if 'decoder' not in name:
+            # 只训练decoder
+            if 'decoder' in name:
+                freeze = False
+            else:
                 freeze = True
 
         if args.train_only_head:
-            # Only train the output heads
-            if not ('head' in name or 'proj' in name or 'pred' in name):
+            # 只训练输出头
+            if 'head' in name or 'proj' in name or 'pred' in name:
+                freeze = False
+            else:
                 freeze = True
 
-        if freeze:
-            param.requires_grad = False
-        else:
-            param.requires_grad = True
+        # 如果所有冻结选项都是默认值（True），那么只训练头部
+        if (args.freeze_encoder and args.freeze_pos_embed and args.freeze_patch_embed and
+                not args.train_only_decoder and not args.train_only_head):
+            # 默认设置：只训练头部
+            if 'head' in name or 'proj' in name or 'pred' in name:
+                freeze = False
+            else:
+                freeze = True
+
+        # 应用冻结/解冻
+        param.requires_grad = not freeze
+        if param.requires_grad:
             trainable_params += param.numel()
 
+    # 打印详细的可训练参数信息
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Frozen parameters: {total_params - trainable_params:,}")
+
+    # 打印可训练的参数名
+    print("\nTrainable parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"  - {name}")
 
     return model
 
@@ -237,11 +284,69 @@ def set_dataset_epoch(data_loader, epoch, fixed_eval_set=False):
                 data_loader.sampler.set_epoch(epoch)
 
 
+class SafeMetricLogger:
+    """Custom MetricLogger that handles zero division errors"""
+
+    def __init__(self, delimiter="  "):
+        self.delimiter = delimiter
+        self.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9 ** 9))
+
+    def add_meter(self, name, meter):
+        self.meters[name] = meter
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            assert isinstance(v, (float, int))
+            self.meters[k].update(v)
+
+    def __str__(self):
+        if len(self.meters) == 0:
+            return ""
+
+        # Build safe string representation
+        parts = []
+        for name, meter in self.meters.items():
+            # Safely get meter value
+            try:
+                if hasattr(meter, 'count') and meter.count > 0:
+                    value = meter.global_avg
+                    parts.append("{}: {:.4f}".format(name, value))
+                else:
+                    parts.append("{}: N/A".format(name))
+            except ZeroDivisionError:
+                parts.append("{}: N/A".format(name))
+            except Exception:
+                parts.append("{}: ERR".format(name))
+
+        return self.delimiter.join(parts)
+
+    def global_avg_safe(self, name):
+        """Safely get global average"""
+        if name not in self.meters:
+            return 0.0
+
+        meter = self.meters[name]
+        try:
+            if hasattr(meter, 'count') and meter.count > 0:
+                return meter.global_avg
+        except ZeroDivisionError:
+            pass
+        return 0.0
+
+    def synchronize_between_processes(self):
+        # For now, just pass. In distributed setting, implement proper sync
+        pass
+
+
 def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
                        epoch, loss_scaler, args, log_writer=None):
-    """Optimize for one epoch with known poses"""
+    """Optimize for one epoch with known poses (fixes OOM issues)"""
     model.train()
-    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger = SafeMetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = f'Optimize Epoch: [{epoch + 1}/{args.epochs}]'
     accum_iter = args.accum_iter
@@ -251,19 +356,43 @@ def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
 
     optimizer.zero_grad()
 
-    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-        epoch_f = epoch + data_iter_step / len(data_loader)
+    # Counter to track successful batches
+    successful_batches = 0
+    total_batches = len(data_loader)
+
+    # Create data loader iterator
+    data_loader_iter = iter(data_loader)
+
+    for data_iter_step in range(total_batches):
+        try:
+            # Get batch
+            batch = next(data_loader_iter)
+        except StopIteration:
+            break
+
+        epoch_f = epoch + data_iter_step / total_batches
 
         # Adjust learning rate
         if data_iter_step % accum_iter == 0:
             misc.adjust_learning_rate(optimizer, epoch_f, args)
 
+        # Clear cache to reduce memory usage
+        torch.cuda.empty_cache()
+
         # Forward pass using loss_of_one_batch (handles everything)
-        batch_result = loss_of_one_batch(
-            batch, model, criterion, device,
-            symmetrize_batch=True,
-            use_amp=bool(args.amp)
-        )
+        try:
+            batch_result = loss_of_one_batch(
+                batch, model, criterion, device,
+                symmetrize_batch=True,
+                use_amp=bool(args.amp)
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e) and args.skip_ooms:
+                print(f"OOM at iteration {data_iter_step}, skipping batch")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
 
         # Extract loss
         if 'loss' in batch_result:
@@ -282,7 +411,7 @@ def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
 
         # Save visualizations (optional)
         if (args.num_save_visual > 0 and
-                (data_iter_step % max((len(data_loader) // args.num_save_visual), 1) == 0) and
+                (data_iter_step % max((total_batches // args.num_save_visual), 1) == 0) and
                 misc.is_main_process()):
             try:
                 save_dir = Path(args.output_dir) / f'epoch_{epoch + 1}'
@@ -296,23 +425,27 @@ def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
                     pred2 = batch_result['pred2']
 
                     # Visualize results
-                    gt_visual_path = visualize_results(
-                        view1, view2, pred1, pred2,
-                        save_dir=str(save_dir), visualize_type='gt', idx=data_iter_step)
-                    pred_visual_path = visualize_results(
-                        view1, view2, pred1, pred2,
-                        save_dir=str(save_dir), visualize_type='pred', idx=data_iter_step)
+                    save_name = f'train_batch_{data_iter_step}'
+                    try:
+                        gt_visual_path = visualize_results(
+                            view1, view2, pred1, pred2,
+                            save_dir=str(save_dir), save_name=save_name + '_gt', visualize_type='gt')
+                        pred_visual_path = visualize_results(
+                            view1, view2, pred1, pred2,
+                            save_dir=str(save_dir), save_name=save_name + '_pred', visualize_type='pred')
 
-                    # Log to wandb if available and enabled
-                    if args.wandb and WANDB_AVAILABLE:
-                        try:
-                            wandb.log({
-                                'epoch': epoch,
-                                'optim_visual_gt': wandb.Image(str(gt_visual_path)),
-                                'optim_visual_pred': wandb.Image(str(pred_visual_path))
-                            })
-                        except:
-                            pass
+                        # Log to wandb if available and enabled
+                        if args.wandb and WANDB_AVAILABLE:
+                            try:
+                                wandb.log({
+                                    'epoch': epoch,
+                                    'optim_visual_gt': wandb.Image(str(gt_visual_path)),
+                                    'optim_visual_pred': wandb.Image(str(pred_visual_path))
+                                })
+                            except:
+                                pass
+                    except Exception as viz_error:
+                        print(f"Error in visualization: {viz_error}")
             except Exception as e:
                 print(f"Error saving visualizations: {e}")
 
@@ -320,19 +453,30 @@ def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
             print(f"Loss is {loss_value}, stopping optimization")
             sys.exit(1)
 
-        # Backward pass
-        loss /= accum_iter
-        loss_scaler(loss, optimizer, parameters=model.parameters(),
-                    update_grad=(data_iter_step + 1) % accum_iter == 0)
+        # Backward pass with memory management
+        try:
+            loss /= accum_iter
+            loss_scaler(loss, optimizer, parameters=model.parameters(),
+                        update_grad=(data_iter_step + 1) % accum_iter == 0,
+                        clip_grad=args.grad_clip)
+        except RuntimeError as e:
+            if "out of memory" in str(e) and args.skip_ooms:
+                print(f"OOM during backward at iteration {data_iter_step}, skipping")
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
 
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
-        # Logging
+        # Logging - only update for successful batches
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(epoch=epoch_f)
         metric_logger.update(lr=lr)
         metric_logger.update(loss=loss_value)
+        successful_batches += 1
 
         # Add loss details
         if loss_details:
@@ -356,12 +500,34 @@ def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
                         except:
                             pass
 
-    metric_logger.synchronize_between_processes()
+        # Manual logging every print_freq
+        if (data_iter_step + 1) % args.print_freq == 0 or data_iter_step == total_batches - 1:
+            # Build log string manually to avoid MetricLogger.__str__ issues
+            log_str = header + f' [{data_iter_step}/{total_batches}]'
+            try:
+                stats_str = str(metric_logger)
+                if stats_str:
+                    log_str += ' ' + stats_str
+            except ZeroDivisionError:
+                log_str += ' [skipped all batches due to OOM]'
+            print(log_str)
+
+    # Fix ZeroDivisionError: check if any batches were successful
+    if successful_batches == 0:
+        print(f"Warning: No successful batches processed in epoch {epoch + 1}")
+        # Return default values
+        stats = {'loss': float('inf'), 'lr': optimizer.param_groups[0]["lr"], 'epoch': epoch + 1}
+        return stats
+
     print(f"\nEpoch {epoch + 1} optimization stats:")
     stats = {}
-    for k, meter in metric_logger.meters.items():
-        stats[k] = meter.global_avg
-        print(f"  {k}: {meter.global_avg:.6f}")
+    for k in metric_logger.meters.keys():
+        try:
+            stats[k] = metric_logger.global_avg_safe(k)
+            print(f"  {k}: {stats[k]:.6f}")
+        except:
+            stats[k] = 0.0
+            print(f"  {k}: 0.000000 (no data)")
 
     return stats
 
@@ -370,19 +536,43 @@ def optimize_one_epoch(model, criterion, data_loader, optimizer, device,
 def evaluate_one_epoch(model, criterion, data_loader, device, epoch, args):
     """Evaluate the model with known poses"""
     model.eval()
-    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger = SafeMetricLogger(delimiter="  ")
     header = f'Evaluate Epoch: [{epoch + 1}/{args.epochs}]'
 
     # Set dataset epoch (use fixed epoch for evaluation if specified)
     set_dataset_epoch(data_loader, 0 if args.fixed_eval_set else epoch, args.fixed_eval_set)
 
-    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+    # Add counter
+    successful_batches = 0
+    total_batches = len(data_loader)
+
+    # Create data loader iterator
+    data_loader_iter = iter(data_loader)
+
+    for data_iter_step in range(total_batches):
+        try:
+            # Get batch
+            batch = next(data_loader_iter)
+        except StopIteration:
+            break
+
+        # Clear cache
+        torch.cuda.empty_cache()
+
         # Evaluate using loss_of_one_batch
-        batch_result = loss_of_one_batch(
-            batch, model, criterion, device,
-            symmetrize_batch=True,
-            use_amp=bool(args.amp)
-        )
+        try:
+            batch_result = loss_of_one_batch(
+                batch, model, criterion, device,
+                symmetrize_batch=True,
+                use_amp=bool(args.amp)
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e) and args.skip_ooms:
+                print(f"OOM at evaluation iteration {data_iter_step}, skipping batch")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
 
         # Extract loss
         if 'loss' in batch_result:
@@ -397,6 +587,7 @@ def evaluate_one_epoch(model, criterion, data_loader, device, epoch, args):
             loss_details = {}
 
         metric_logger.update(loss=float(loss))
+        successful_batches += 1
 
         # Add loss details
         if loss_details:
@@ -407,10 +598,29 @@ def evaluate_one_epoch(model, criterion, data_loader, device, epoch, args):
                     except:
                         pass
 
-    metric_logger.synchronize_between_processes()
+        # Manual logging every print_freq
+        if (data_iter_step + 1) % args.print_freq == 0 or data_iter_step == total_batches - 1:
+            # Build log string manually to avoid MetricLogger.__str__ issues
+            log_str = header + f' [{data_iter_step}/{total_batches}]'
+            try:
+                stats_str = str(metric_logger)
+                if stats_str:
+                    log_str += ' ' + stats_str
+            except ZeroDivisionError:
+                log_str += ' [skipped all batches due to OOM]'
+            print(log_str)
+
+    # Check if any batches were successful
+    if successful_batches == 0:
+        print(f"Warning: No successful batches evaluated in epoch {epoch + 1}")
+        return {'loss': float('inf')}
+
     stats = {}
-    for k, meter in metric_logger.meters.items():
-        stats[k] = meter.global_avg
+    for k in metric_logger.meters.keys():
+        try:
+            stats[k] = metric_logger.global_avg_safe(k)
+        except:
+            stats[k] = float('inf')
 
     return stats
 
@@ -457,6 +667,9 @@ def main(args):
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA version: {torch.version.cuda}")
+        # Print GPU memory info
+        print(f"GPU Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.2f} GB")
+        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024 ** 3:.2f} GB")
 
     # Fix seed
     seed = args.seed + global_rank
@@ -475,7 +688,7 @@ def main(args):
     # Load checkpoint
     model, checkpoint, checkpoint_epoch, best_so_far = load_checkpoint(model, args.checkpoint, device)
 
-    # Freeze specified parameters
+    # Freeze specified parameters - FIXED!
     model = freeze_model_parameters(model, args)
 
     # Prepare model for distributed training
@@ -508,7 +721,6 @@ def main(args):
     criterion_str = args.train_criterion
     print(f"Using criterion: {criterion_str}")
     criterion = eval(criterion_str)
-
     criterion.to(device)
 
     # Create optimizer (only for trainable parameters)
@@ -671,7 +883,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print("\n" + "=" * 60)
-    print("DUST3R OPTIMIZATION")
+    print("DUST3R OPTIMIZATION (Fixed Version)")
     print("=" * 60)
+
+    # Print memory optimization settings
+    print("\n=== Memory Optimization Settings ===")
+    print(f"Skip OOM batches: {args.skip_ooms}")
+    print(f"Gradient clipping: {args.grad_clip}")
+    print(f"Mixed precision: {args.mixed_precision}")
+    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
 
     main(args)

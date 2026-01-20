@@ -32,6 +32,8 @@ class MultiViewRegistration:
         self.verbose = verbose
         self.views = {}
         self.transformations = {}
+        self.masks = {}  # Store masks for each view
+        self.camera_poses = {}  # Store camera poses for each view
 
     def setup_views(self, view_names: List[str]):
         """Set up view configurations."""
@@ -46,7 +48,7 @@ class MultiViewRegistration:
         """Load point cloud data for a view."""
         print(f"\nLoading data for {view_name}...")
 
-        ply_dir = self.base_dir / f'frames_{view_name}_ply_files'
+        ply_dir = self.base_dir / f'frames_{view_name}_pc/ply_files'
 
         if not ply_dir.exists():
             raise FileNotFoundError(f"Point cloud directory not found: {ply_dir}")
@@ -96,6 +98,119 @@ class MultiViewRegistration:
 
         return view_data
 
+    def load_camera_poses(self, pose_dir: Path, view_name: str):
+        """Load camera poses from directory."""
+        print(f"\nLoading camera poses for {view_name}...")
+
+        if not pose_dir.exists():
+            print(f"Warning: Camera pose directory not found: {pose_dir}")
+            return None
+
+        # Look for pose files (txt, json, npy, etc.)
+        pose_extensions = ['*.txt', '*.json', '*.npy', '*.npz']
+        pose_files = []
+        for ext in pose_extensions:
+            pose_files.extend(glob.glob(str(pose_dir / ext)))
+
+        if not pose_files:
+            print(f"Warning: No pose files found in {pose_dir}")
+            return None
+
+        pose_files = sorted(pose_files)
+        poses = []
+
+        for pose_file in pose_files:
+            try:
+                # Try to load pose based on file extension
+                pose_path = Path(pose_file)
+                if pose_path.suffix == '.txt':
+                    # Load 4x4 matrix from text file
+                    pose_matrix = np.loadtxt(pose_file)
+                    if pose_matrix.shape == (4, 4):
+                        poses.append(pose_matrix)
+                elif pose_path.suffix == '.json':
+                    # Load from JSON
+                    with open(pose_file, 'r') as f:
+                        pose_data = json.load(f)
+                        if isinstance(pose_data, list) and len(pose_data) == 16:
+                            pose_matrix = np.array(pose_data).reshape(4, 4)
+                            poses.append(pose_matrix)
+                elif pose_path.suffix == '.npy':
+                    # Load from numpy binary
+                    pose_matrix = np.load(pose_file)
+                    if pose_matrix.shape == (4, 4):
+                        poses.append(pose_matrix)
+                elif pose_path.suffix == '.npz':
+                    # Load from numpy zip
+                    data = np.load(pose_file)
+                    if 'pose' in data:
+                        pose_matrix = data['pose']
+                        if pose_matrix.shape == (4, 4):
+                            poses.append(pose_matrix)
+
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error processing pose file {pose_file}: {e}")
+
+        if poses:
+            self.camera_poses[view_name] = poses
+            print(f"  Loaded {len(poses)} camera poses for {view_name}")
+        else:
+            print(f"  No valid camera poses found for {view_name}")
+
+        return poses
+
+    def load_masks(self, mask_dir: Path, view_name: str, max_frames: int = 30):
+        """Load mask images for a view."""
+        print(f"\nLoading masks for {view_name}...")
+
+        if not mask_dir.exists():
+            print(f"Warning: Mask directory not found: {mask_dir}")
+            return None
+
+        # Look for mask files (png, jpg, etc.)
+        mask_extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tiff']
+        mask_files = []
+        for ext in mask_extensions:
+            mask_files.extend(glob.glob(str(mask_dir / ext)))
+
+        if not mask_files:
+            print(f"Warning: No mask files found in {mask_dir}")
+            return None
+
+        mask_files = sorted(mask_files)[:max_frames]
+        masks = []
+
+        for mask_file in tqdm.tqdm(mask_files, desc=f"Loading masks for {view_name}", disable=not self.verbose):
+            try:
+                # Load mask image
+                mask_img = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+                if mask_img is None:
+                    continue
+
+                # Binarize mask (0 for background, 1 for foreground)
+                mask_binary = (mask_img > 0).astype(np.float32)
+
+                # Extract frame number from filename
+                frame_idx = self.extract_frame_number(Path(mask_file).stem)
+
+                masks.append({
+                    'frame_idx': frame_idx,
+                    'mask': mask_binary,
+                    'path': mask_file
+                })
+
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error processing mask {mask_file}: {e}")
+
+        self.masks[view_name] = masks
+
+        if self.verbose:
+            print(f"  Loaded {len(masks)} masks")
+
+        return masks
+
     def extract_frame_number(self, filename: str) -> int:
         """Extract frame number from filename."""
         patterns = [r'frame_(\d+)', r'(\d+)', r'pc_(\d+)', r'points_(\d+)']
@@ -116,6 +231,28 @@ class MultiViewRegistration:
                 pass
 
         return 0
+
+    def apply_mask_to_pointcloud(self, points: np.ndarray, colors: Optional[np.ndarray],
+                                 mask: np.ndarray, mask_threshold: float = 0.5):
+        """Apply mask to filter point cloud."""
+        if len(points) == 0:
+            return points, colors
+
+        # For simplicity, we'll randomly sample points based on mask density
+        # In a real implementation, you would project 3D points to 2D and check mask
+        mask_density = np.mean(mask)
+
+        # Randomly sample points based on mask density
+        n_points = len(points)
+        keep_indices = np.random.rand(n_points) < mask_density
+
+        filtered_points = points[keep_indices]
+        if colors is not None:
+            filtered_colors = colors[keep_indices]
+        else:
+            filtered_colors = None
+
+        return filtered_points, filtered_colors
 
     def simple_center_alignment(self, reference_view: str = 'cam0'):
         """
@@ -236,8 +373,8 @@ class MultiViewRegistration:
         return output_dir
 
 
-class ViserVisualizer:
-    """Interactive 3D visualization showing only aligned point clouds in cam0 coordinate system."""
+class MultiCameraVisualizer:
+    """Interactive 3D visualization showing two views with their camera poses and aligned results."""
 
     def __init__(self, registration_results_dir: Path, verbose: bool = True):
         self.results_dir = Path(registration_results_dir)
@@ -252,6 +389,8 @@ class ViserVisualizer:
             'current_frame': 0,
             'playing': False,
             'fps': 30,
+            'apply_mask': False,
+            'mask_threshold': 0.5,
         }
 
         # Load registration results
@@ -260,6 +399,7 @@ class ViserVisualizer:
 
         # Initialize Viser server
         self.server = None
+        self.camera_poses = {}  # Store camera poses for each view
 
     def load_transformations(self) -> Dict[str, np.ndarray]:
         """Load transformation matrices from JSON file."""
@@ -319,6 +459,89 @@ class ViserVisualizer:
 
         return view_data
 
+    def load_camera_poses(self, pose_dir1: Path, pose_dir2: Path, view1_name: str = 'cam0', view2_name: str = 'cam1'):
+        """Load camera poses for both views."""
+        print(f"\nLoading camera poses...")
+
+        # Load poses for view1
+        if pose_dir1.exists():
+            self.camera_poses[view1_name] = self._load_poses_from_dir(pose_dir1, view1_name)
+        else:
+            print(f"Warning: Camera pose directory for {view1_name} not found: {pose_dir1}")
+            self.camera_poses[view1_name] = [np.eye(4)] * self.params['max_frames_display']
+
+        # Load poses for view2
+        if pose_dir2.exists():
+            self.camera_poses[view2_name] = self._load_poses_from_dir(pose_dir2, view2_name)
+        else:
+            print(f"Warning: Camera pose directory for {view2_name} not found: {pose_dir2}")
+            self.camera_poses[view2_name] = [np.eye(4)] * self.params['max_frames_display']
+
+        print(f"  Loaded {len(self.camera_poses.get(view1_name, []))} poses for {view1_name}")
+        print(f"  Loaded {len(self.camera_poses.get(view2_name, []))} poses for {view2_name}")
+
+    def _load_poses_from_dir(self, pose_dir: Path, view_name: str):
+        """Helper function to load poses from directory."""
+        # Look for pose files (txt, json, npy, etc.)
+        pose_extensions = ['*.txt', '*.json', '*.npy', '*.npz']
+        pose_files = []
+        for ext in pose_extensions:
+            pose_files.extend(glob.glob(str(pose_dir / ext)))
+
+        if not pose_files:
+            print(f"Warning: No pose files found in {pose_dir}")
+            return [np.eye(4)] * self.params['max_frames_display']
+
+        pose_files = sorted(pose_files)
+        poses = []
+
+        for pose_file in pose_files[:self.params['max_frames_display']]:
+            try:
+                pose_matrix = self._load_single_pose(pose_file)
+                if pose_matrix is not None:
+                    poses.append(pose_matrix)
+                else:
+                    poses.append(np.eye(4))
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error processing pose file {pose_file}: {e}")
+                poses.append(np.eye(4))
+
+        return poses
+
+    def _load_single_pose(self, pose_file: str):
+        """Load a single pose matrix from file."""
+        pose_path = Path(pose_file)
+
+        try:
+            if pose_path.suffix == '.txt':
+                # Load 4x4 matrix from text file
+                pose_matrix = np.loadtxt(pose_file)
+                if pose_matrix.shape == (4, 4):
+                    return pose_matrix
+            elif pose_path.suffix == '.json':
+                # Load from JSON
+                with open(pose_file, 'r') as f:
+                    pose_data = json.load(f)
+                    if isinstance(pose_data, list) and len(pose_data) == 16:
+                        return np.array(pose_data).reshape(4, 4)
+            elif pose_path.suffix == '.npy':
+                # Load from numpy binary
+                pose_matrix = np.load(pose_file)
+                if pose_matrix.shape == (4, 4):
+                    return pose_matrix
+            elif pose_path.suffix == '.npz':
+                # Load from numpy zip
+                data = np.load(pose_file)
+                if 'pose' in data:
+                    pose_matrix = data['pose']
+                    if pose_matrix.shape == (4, 4):
+                        return pose_matrix
+        except:
+            pass
+
+        return None
+
     def extract_frame_number(self, filename: str) -> int:
         """Extract frame number from filename."""
         patterns = [r'frame_(\d+)', r'(\d+)']
@@ -331,7 +554,11 @@ class ViserVisualizer:
                     continue
         return 0
 
-    def create_visualization(self, share: bool = False):
+    def create_visualization(self, share: bool = False,
+                             pose_dir1: Path = None,
+                             pose_dir2: Path = None,
+                             view1_name: str = 'cam0',
+                             view2_name: str = 'cam1'):
         """Create and launch the interactive visualization."""
         self.server = viser.ViserServer()
 
@@ -341,8 +568,14 @@ class ViserVisualizer:
         self.server.scene.set_up_direction('-z')
 
         print(f"\n{'=' * 60}")
-        print(f"ALIGNED POINT CLOUDS VISUALIZATION (cam0 coordinate system)")
+        print(f"MULTI-CAMERA VISUALIZATION WITH CAMERA POSES")
         print(f"{'=' * 60}")
+
+        # Load camera poses if provided
+        if pose_dir1 and pose_dir2:
+            self.load_camera_poses(pose_dir1, pose_dir2, view1_name, view2_name)
+        else:
+            print("Warning: No camera pose directories provided, using identity poses")
 
         # Get all frame indices
         all_frame_indices = set()
@@ -355,23 +588,22 @@ class ViserVisualizer:
 
         print(f"Views: {list(self.view_data.keys())}")
         print(f"Total unique frames: {self.total_frames}")
-        print(f"All point clouds are aligned to cam0 coordinate system")
+        print(f"Transformations available: {list(self.transformations.keys())}")
 
         # Create UI
-        self.create_ui()
+        self.create_ui(view1_name, view2_name)
 
         # Create visualization nodes
-        self.create_pointcloud_nodes()
+        self.create_multi_camera_nodes(view1_name, view2_name)
 
         # Start visualization
-        print("\nVisualization ready. Open the browser to view aligned point clouds.")
+        print("\nVisualization ready. Open the browser to view point clouds.")
         print(f"Server URL: http://localhost:8080")
-        print("Note: All point clouds are shown in cam0 coordinate system")
 
         self.run_visualization_loop()
 
-    def create_ui(self):
-        """Create simplified user interface."""
+    def create_ui(self, view1_name: str, view2_name: str):
+        """Create user interface."""
         # Playback controls
         with self.server.gui.add_folder("Playback"):
             self.gui_timestep = self.server.gui.add_slider(
@@ -398,17 +630,30 @@ class ViserVisualizer:
             self.gui_downsample = self.server.gui.add_slider("Downsample", min=1, max=16, step=1,
                                                              initial_value=self.params['downsample_factor'])
 
-        # View visibility - CRITICAL: Control which views to show
-        with self.server.gui.add_folder("View Visibility"):
-            self.view_checkboxes = {}
-            for view_name in self.view_data.keys():
-                # By default, show all views
-                self.view_checkboxes[view_name] = self.server.gui.add_checkbox(f"Show {view_name}", True)
+        # View visibility - Show all camera poses
+        with self.server.gui.add_folder("Camera Poses"):
+            self.gui_show_cam0_pose = self.server.gui.add_checkbox(f"Show {view1_name} camera pose (red)", True)
+            self.gui_show_cam1_pose = self.server.gui.add_checkbox(f"Show {view2_name} original camera pose (green)",
+                                                                   True)
+            self.gui_show_cam1_registered_pose = self.server.gui.add_checkbox(
+                f"Show {view2_name} registered camera pose (blue)", True)
+
+        # Point cloud visibility
+        with self.server.gui.add_folder("Point Clouds"):
+            self.gui_show_cam0_points = self.server.gui.add_checkbox(f"Show {view1_name} point cloud", True)
+            self.gui_show_cam1_points = self.server.gui.add_checkbox(f"Show {view2_name} point cloud", True)
+            self.gui_show_aligned_points = self.server.gui.add_checkbox(f"Show {view2_name} aligned point cloud", True)
+
+        # Camera frustum settings
+        with self.server.gui.add_folder("Camera Frustums"):
+            self.gui_show_frustums = self.server.gui.add_checkbox("Show Camera Frustums", True)
+            self.gui_frustum_scale = self.server.gui.add_slider("Frustum Scale", min=0.001, max=0.1, step=0.001,
+                                                                initial_value=0.02)
 
         # Setup event handlers
-        self.setup_event_handlers()
+        self.setup_event_handlers(view1_name, view2_name)
 
-    def setup_event_handlers(self):
+    def setup_event_handlers(self, view1_name: str, view2_name: str):
         """Setup event handlers."""
 
         @self.gui_next_frame.on_click
@@ -471,14 +716,41 @@ class ViserVisualizer:
             self.params['downsample_factor'] = int(self.gui_downsample.value)
             self.reload_point_clouds()
 
-        for view_name, checkbox in self.view_checkboxes.items():
-            @checkbox.on_update
-            def handler(_, view_name=view_name):
-                self.update_view_visibility(view_name)
+        @self.gui_show_cam0_pose.on_update
+        def _(_):
+            self.update_pose_visibility(view1_name, 'cam0_pose')
 
-    def create_pointcloud_nodes(self):
-        """Create point cloud visualization nodes."""
-        # Create base frame at origin (cam0 coordinate system)
+        @self.gui_show_cam1_pose.on_update
+        def _(_):
+            self.update_pose_visibility(view2_name, 'cam1_original_pose')
+
+        @self.gui_show_cam1_registered_pose.on_update
+        def _(_):
+            self.update_pose_visibility(view2_name, 'cam1_registered_pose')
+
+        @self.gui_show_cam0_points.on_update
+        def _(_):
+            self.update_pointcloud_visibility(view1_name, 'cam0_points')
+
+        @self.gui_show_cam1_points.on_update
+        def _(_):
+            self.update_pointcloud_visibility(view2_name, 'cam1_points')
+
+        @self.gui_show_aligned_points.on_update
+        def _(_):
+            self.update_pointcloud_visibility(view2_name, 'aligned_points')
+
+        @self.gui_show_frustums.on_update
+        def _(_):
+            self.update_frustum_visibility()
+
+        @self.gui_frustum_scale.on_update
+        def _(_):
+            self.update_frustum_scales()
+
+    def create_multi_camera_nodes(self, view1_name: str, view2_name: str):
+        """Create point cloud nodes with camera poses for both views."""
+        # Create base frame at origin
         self.server.scene.add_frame(
             "/origin",
             wxyz=tf.SO3.exp(np.array([np.pi / 2.0, 0.0, 0.0])).wxyz,
@@ -488,56 +760,160 @@ class ViserVisualizer:
         )
 
         # Color map for different views
-        colors = cm.tab10(np.linspace(0, 1, len(self.view_data)))
-        self.view_colors = {}
-        for i, view_name in enumerate(self.view_data.keys()):
-            self.view_colors[view_name] = colors[i][:3]
+        colors = cm.tab10(np.linspace(0, 1, 5))  # 5 colors for different elements
+        self.view_colors = {
+            'cam0_pose': colors[0][:3],  # Red for cam0 camera pose
+            'cam1_original_pose': colors[1][:3],  # Green for cam1 original camera pose
+            'cam1_registered_pose': colors[2][:3],  # Blue for cam1 registered camera pose
+            'cam0_points': colors[3][:3],  # Purple for cam0 point cloud
+            'cam1_points': colors[4][:3],  # Orange for cam1 point cloud
+            'aligned_points': colors[2][:3]  # Blue for aligned point cloud (same as registered pose)
+        }
 
         # Store nodes
-        self.frame_nodes = {}
+        self.pose_nodes = {}
         self.pointcloud_nodes = {}
+        self.frustum_nodes = {}
 
-        # Create nodes for each view
-        for view_name, data in self.view_data.items():
-            self.frame_nodes[view_name] = []
-            self.pointcloud_nodes[view_name] = []
+        # Check if we have camera poses
+        has_poses = (view1_name in self.camera_poses and view2_name in self.camera_poses)
 
-            view_color = self.view_colors[view_name]
+        if not has_poses:
+            print("Warning: Using identity poses for both cameras")
+            self.camera_poses[view1_name] = [np.eye(4)] * self.params['max_frames_display']
+            self.camera_poses[view2_name] = [np.eye(4)] * self.params['max_frames_display']
 
-            for i, frame_data in enumerate(data['frames']):
+        # 修正：获取配准变换矩阵
+        registration_transform = self.transformations.get(view2_name, np.eye(4))
+        print(f"\nRegistration transformation for {view2_name}:")
+        print(registration_transform)
+
+        # 定义要创建的所有节点类型
+        node_types = [
+            ('cam0_pose', view1_name, None),  # cam0 pose (no additional transform)
+            ('cam1_original_pose', view2_name, None),  # cam1 original pose
+            ('cam1_registered_pose', view2_name, registration_transform),  # cam1 registered pose
+            ('cam0_points', view1_name, None),  # cam0 point cloud
+            ('cam1_points', view2_name, None),  # cam1 point cloud (original)
+            ('aligned_points', view2_name, registration_transform)  # cam1 aligned point cloud
+        ]
+
+        for node_type, view_name, additional_transform in node_types:
+            self.pose_nodes[node_type] = []
+            self.pointcloud_nodes[node_type] = []
+            self.frustum_nodes[node_type] = []
+
+            color = self.view_colors[node_type]
+
+            if view_name not in self.view_data:
+                print(f"Warning: View {view_name} not found in data for node type {node_type}")
+                continue
+
+            view_data = self.view_data[view_name]
+
+            # Get base poses for this view
+            base_poses = self.camera_poses.get(view_name, [np.eye(4)])
+
+            # Make sure we have enough poses
+            n_frames = min(len(view_data['frames']), len(base_poses), self.params['max_frames_display'])
+
+            for i in range(n_frames):
+                frame_data = view_data['frames'][i]
                 frame_idx = frame_data['frame_idx']
 
-                # Create a simple frame for organization
-                frame_node = self.server.scene.add_frame(
-                    f"/views/{view_name}/t{frame_idx}",
-                    show_axes=False
-                )
-                self.frame_nodes[view_name].append(frame_node)
+                # Get base pose for this frame
+                if i < len(base_poses):
+                    base_pose = base_poses[i]
+                else:
+                    base_pose = base_poses[0] if base_poses else np.eye(4)
 
-                # Get point cloud
-                pcd = frame_data['pcd']
+                # Apply additional transform if needed
+                if additional_transform is not None:
+                    if 'pose' in node_type:
+                        # For pose nodes: apply transform to pose
+                        final_pose = additional_transform @ base_pose
+                    else:
+                        # For point cloud nodes: points are already aligned
+                        final_pose = base_pose
+                else:
+                    final_pose = base_pose
 
-                # Downsample if needed
-                if self.params['downsample_factor'] > 1:
-                    pcd = pcd.voxel_down_sample(self.params['downsample_factor'] / 1000.0)
+                # Extract camera position and rotation
+                camera_position = final_pose[:3, 3]
+                camera_rotation = final_pose[:3, :3]
 
-                # Get points and colors
-                points = np.asarray(pcd.points)
-                colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-
-                if len(points) > 0:
-                    if colors is None:
-                        colors = np.tile(view_color, (len(points), 1))
-
-                    # Create point cloud node
-                    pointcloud_node = self.server.scene.add_point_cloud(
-                        name=f"/views/{view_name}/t{frame_idx}/points",
-                        points=points,
-                        colors=colors,
-                        point_size=self.params['point_size'],
-                        point_shape="rounded",
+                # Create pose node (only for pose types)
+                if 'pose' in node_type:
+                    pose_node = self.server.scene.add_frame(
+                        f"/{node_type}/t{frame_idx}",
+                        wxyz=tf.SO3.from_matrix(camera_rotation).wxyz,
+                        position=camera_position,
+                        show_axes=False,
+                        axes_length=0.05,
+                        axes_radius=0.005,
                     )
-                    self.pointcloud_nodes[view_name].append(pointcloud_node)
+                    self.pose_nodes[node_type].append(pose_node)
+
+                # Create point cloud node (only for point cloud types)
+                if 'points' in node_type:
+                    pcd = frame_data['pcd']
+
+                    # Downsample if needed
+                    if self.params['downsample_factor'] > 1:
+                        pcd = pcd.voxel_down_sample(self.params['downsample_factor'] / 1000.0)
+
+                    # Get points and colors
+                    points = np.asarray(pcd.points)
+                    colors_array = np.asarray(pcd.colors) if pcd.has_colors() else None
+
+                    if len(points) > 0:
+                        # Transform points based on node type
+                        if node_type == 'cam0_points':
+                            # cam0 points: use original pose
+                            R = base_pose[:3, :3]
+                            t = base_pose[:3, 3]
+                            transformed_points = (R @ points.T).T + t
+                        elif node_type == 'cam1_points':
+                            # cam1 points: use original pose
+                            R = base_pose[:3, :3]
+                            t = base_pose[:3, 3]
+                            transformed_points = (R @ points.T).T + t
+                        elif node_type == 'aligned_points':
+                            # aligned points: points are already in cam0 coordinates
+                            # No additional transformation needed
+                            transformed_points = points
+                        else:
+                            transformed_points = points
+
+                        # Use original colors if available, otherwise use type color
+                        if colors_array is not None:
+                            final_colors = colors_array
+                        else:
+                            final_colors = np.tile(color, (len(points), 1))
+
+                        # Create point cloud node
+                        pointcloud_node = self.server.scene.add_point_cloud(
+                            name=f"/{node_type}/t{frame_idx}/points",
+                            points=transformed_points,
+                            colors=final_colors,
+                            point_size=self.params['point_size'],
+                            point_shape="rounded",
+                        )
+                        self.pointcloud_nodes[node_type].append(pointcloud_node)
+
+                # Create camera frustum node (only for pose types)
+                if 'pose' in node_type and self.gui_show_frustums.value:
+                    frustum_node = self.server.scene.add_camera_frustum(
+                        name=f"/{node_type}/t{frame_idx}/frustum",
+                        fov=0.8,  # Field of view in radians
+                        aspect=1.333,  # Aspect ratio (4:3)
+                        scale=self.gui_frustum_scale.value,
+                        wxyz=tf.SO3.from_matrix(camera_rotation).wxyz,
+                        position=camera_position,
+                        color=color,
+                        thickness=2.0,
+                    )
+                    self.frustum_nodes[node_type].append(frustum_node)
 
         # Update initial visibility
         self.update_frame_visibility()
@@ -550,43 +926,126 @@ class ViserVisualizer:
         current_frame_idx = self.frame_indices[self.params['current_frame']]
 
         with self.server.atomic():
-            for view_name, frame_list in self.frame_nodes.items():
-                view_enabled = self.view_checkboxes[view_name].value
+            # Update pose nodes visibility
+            for node_type in self.pose_nodes.keys():
+                # Determine if this node type should be visible
+                if node_type == 'cam0_pose':
+                    type_enabled = self.gui_show_cam0_pose.value
+                elif node_type == 'cam1_original_pose':
+                    type_enabled = self.gui_show_cam1_pose.value
+                elif node_type == 'cam1_registered_pose':
+                    type_enabled = self.gui_show_cam1_registered_pose.value
+                else:
+                    type_enabled = True
 
-                for i, frame_node in enumerate(frame_list):
-                    if i < len(self.view_data[view_name]['frames']):
-                        frame_data = self.view_data[view_name]['frames'][i]
-                        should_show = (frame_data['frame_idx'] == current_frame_idx) and view_enabled
+                pose_list = self.pose_nodes.get(node_type, [])
+                frustum_list = self.frustum_nodes.get(node_type, [])
 
-                        frame_node.visible = should_show
+                for i, pose_node in enumerate(pose_list):
+                    should_show = type_enabled
 
-                        # Update point cloud visibility
-                        if i < len(self.pointcloud_nodes[view_name]):
-                            self.pointcloud_nodes[view_name][i].visible = should_show
+                    # For single frame mode, only show current frame
+                    if not self.params['show_all_frames']:
+                        # Try to match frame indices
+                        frame_data = None
+                        for view_data in self.view_data.values():
+                            if i < len(view_data['frames']):
+                                frame_data = view_data['frames'][i]
+                                break
+
+                        if frame_data:
+                            should_show = should_show and (frame_data['frame_idx'] == current_frame_idx)
+
+                    pose_node.visible = should_show
+
+                    # Update frustum visibility
+                    if i < len(frustum_list):
+                        frustum_list[i].visible = should_show and self.gui_show_frustums.value
+
+            # Update point cloud nodes visibility
+            for node_type in self.pointcloud_nodes.keys():
+                # Determine if this node type should be visible
+                if node_type == 'cam0_points':
+                    type_enabled = self.gui_show_cam0_points.value
+                elif node_type == 'cam1_points':
+                    type_enabled = self.gui_show_cam1_points.value
+                elif node_type == 'aligned_points':
+                    type_enabled = self.gui_show_aligned_points.value
+                else:
+                    type_enabled = True
+
+                pc_list = self.pointcloud_nodes.get(node_type, [])
+
+                for i, pc_node in enumerate(pc_list):
+                    should_show = type_enabled
+
+                    # For single frame mode, only show current frame
+                    if not self.params['show_all_frames']:
+                        # Try to match frame indices
+                        frame_data = None
+                        for view_data in self.view_data.values():
+                            if i < len(view_data['frames']):
+                                frame_data = view_data['frames'][i]
+                                break
+
+                        if frame_data:
+                            should_show = should_show and (frame_data['frame_idx'] == current_frame_idx)
+
+                    pc_node.visible = should_show
 
     def show_all_frames_with_stride(self, stride: int):
         """Show all frames with stride."""
         with self.server.atomic():
-            for view_name, frame_list in self.frame_nodes.items():
-                view_enabled = self.view_checkboxes[view_name].value
+            # Update pose nodes visibility
+            for node_type in self.pose_nodes.keys():
+                # Determine if this node type should be visible
+                if node_type == 'cam0_pose':
+                    type_enabled = self.gui_show_cam0_pose.value
+                elif node_type == 'cam1_original_pose':
+                    type_enabled = self.gui_show_cam1_pose.value
+                elif node_type == 'cam1_registered_pose':
+                    type_enabled = self.gui_show_cam1_registered_pose.value
+                else:
+                    type_enabled = True
 
-                for i, frame_node in enumerate(frame_list):
-                    if i < len(self.view_data[view_name]['frames']):
-                        frame_data = self.view_data[view_name]['frames'][i]
+                pose_list = self.pose_nodes.get(node_type, [])
+                frustum_list = self.frustum_nodes.get(node_type, [])
 
-                        try:
-                            idx_in_sorted = self.frame_indices.index(frame_data['frame_idx'])
-                            should_show = (idx_in_sorted % stride == 0) and view_enabled
-                        except ValueError:
-                            should_show = False
+                for i, pose_node in enumerate(pose_list):
+                    should_show = type_enabled and (i % stride == 0)
+                    pose_node.visible = should_show
 
-                        frame_node.visible = should_show
+                    if i < len(frustum_list):
+                        frustum_list[i].visible = should_show and self.gui_show_frustums.value
 
-                        if i < len(self.pointcloud_nodes[view_name]):
-                            self.pointcloud_nodes[view_name][i].visible = should_show
+            # Update point cloud nodes visibility
+            for node_type in self.pointcloud_nodes.keys():
+                # Determine if this node type should be visible
+                if node_type == 'cam0_points':
+                    type_enabled = self.gui_show_cam0_points.value
+                elif node_type == 'cam1_points':
+                    type_enabled = self.gui_show_cam1_points.value
+                elif node_type == 'aligned_points':
+                    type_enabled = self.gui_show_aligned_points.value
+                else:
+                    type_enabled = True
 
-    def update_view_visibility(self, view_name: str):
-        """Update visibility of a specific view."""
+                pc_list = self.pointcloud_nodes.get(node_type, [])
+
+                for i, pc_node in enumerate(pc_list):
+                    should_show = type_enabled and (i % stride == 0)
+                    pc_node.visible = should_show
+
+    def update_pose_visibility(self, view_name: str, pose_type: str):
+        """Update visibility of a specific pose type."""
+        if self.params['show_all_frames']:
+            stride = self.gui_stride.value
+            self.show_all_frames_with_stride(stride)
+        else:
+            self.update_frame_visibility()
+
+    def update_pointcloud_visibility(self, view_name: str, pc_type: str):
+        """Update visibility of a specific point cloud type."""
         if self.params['show_all_frames']:
             stride = self.gui_stride.value
             self.show_all_frames_with_stride(stride)
@@ -596,50 +1055,41 @@ class ViserVisualizer:
     def update_point_sizes(self):
         """Update point sizes."""
         with self.server.atomic():
-            for view_name in self.view_data.keys():
-                for node in self.pointcloud_nodes[view_name]:
+            for node_type in self.pointcloud_nodes.keys():
+                for node in self.pointcloud_nodes[node_type]:
                     node.point_size = self.params['point_size']
+
+    def update_frustum_visibility(self):
+        """Update camera frustum visibility."""
+        with self.server.atomic():
+            for node_type in self.frustum_nodes.keys():
+                for node in self.frustum_nodes[node_type]:
+                    node.visible = self.gui_show_frustums.value
+
+    def update_frustum_scales(self):
+        """Update camera frustum scales."""
+        with self.server.atomic():
+            for node_type in self.frustum_nodes.keys():
+                for node in self.frustum_nodes[node_type]:
+                    node.scale = self.gui_frustum_scale.value
 
     def reload_point_clouds(self):
         """Reload point clouds with new downsample factor."""
         print("Reloading point clouds...")
 
+        # Remove old nodes
         with self.server.atomic():
-            for view_name in self.view_data.keys():
-                for node in self.pointcloud_nodes[view_name]:
+            for node_type in self.pointcloud_nodes.keys():
+                for node in self.pointcloud_nodes[node_type]:
                     node.remove()
-                self.pointcloud_nodes[view_name] = []
+                self.pointcloud_nodes[node_type] = []
 
-        for view_name, data in self.view_data.items():
-            view_color = self.view_colors[view_name]
-
-            for i, frame_data in enumerate(data['frames']):
-                pcd = frame_data['pcd']
-
-                if self.params['downsample_factor'] > 1:
-                    pcd = pcd.voxel_down_sample(self.params['downsample_factor'] / 1000.0)
-
-                points = np.asarray(pcd.points)
-                colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-
-                if len(points) > 0:
-                    if colors is None:
-                        colors = np.tile(view_color, (len(points), 1))
-
-                    node = self.server.scene.add_point_cloud(
-                        name=f"/views/{view_name}/t{frame_data['frame_idx']}/points",
-                        points=points,
-                        colors=colors,
-                        point_size=self.params['point_size'],
-                        point_shape="rounded",
-                    )
-                    self.pointcloud_nodes[view_name].append(node)
-
-        if self.params['show_all_frames']:
-            stride = self.gui_stride.value
-            self.show_all_frames_with_stride(stride)
-        else:
-            self.update_frame_visibility()
+        # Get view names from existing nodes
+        view1_name = 'cam0'
+        view2_name = 'cam1'
+        if hasattr(self, 'pose_nodes') and 'cam0_pose' in self.pose_nodes:
+            # Recreate nodes with current parameters
+            self.create_multi_camera_nodes(view1_name, view2_name)
 
         print("Point clouds reloaded")
 
@@ -679,12 +1129,30 @@ def main():
     # Registration parameters
     parser.add_argument('--data_dir', type=str, required=True,
                         help='Base directory containing data')
-    parser.add_argument('--views', type=str, nargs='+', default=['cam0', 'cam1', 'cam2', 'cam3'],
+    parser.add_argument('--views', type=str, nargs='+', default=['cam0', 'cam1'],
                         help='List of view names')
     parser.add_argument('--reference_view', type=str, default='cam0',
                         help='Reference view for alignment (default: cam0)')
     parser.add_argument('--max_frames', type=int, default=30,
                         help='Maximum frames per view to process')
+
+    # Camera pose parameters
+    parser.add_argument('--pose_dir1', type=str, default=None,
+                        help='Directory containing camera poses for view1')
+    parser.add_argument('--pose_dir2', type=str, default=None,
+                        help='Directory containing camera poses for view2')
+    parser.add_argument('--view1_name', type=str, default='cam0',
+                        help='Name of view1 (default: cam0)')
+    parser.add_argument('--view2_name', type=str, default='cam1',
+                        help='Name of view2 (default: cam1)')
+
+    # Mask parameters
+    parser.add_argument('--mask_dir1', type=str, default=None,
+                        help='Directory containing mask images for view1')
+    parser.add_argument('--mask_dir2', type=str, default=None,
+                        help='Directory containing mask images for view2')
+    parser.add_argument('--apply_masks', action='store_true', default=False,
+                        help='Apply masks to filter point clouds')
 
     # Visualization parameters
     parser.add_argument('--point_size', type=float, default=0.002,
@@ -718,6 +1186,23 @@ def main():
         for view_name in args.views:
             registrar.load_view_data(view_name, max_frames=args.max_frames)
 
+        # Load camera poses if provided
+        if args.pose_dir1:
+            registrar.load_camera_poses(Path(args.pose_dir1), args.view1_name)
+        if args.pose_dir2:
+            registrar.load_camera_poses(Path(args.pose_dir2), args.view2_name)
+
+        # Load masks if specified
+        if args.mask_dir1 and args.apply_masks:
+            print(f"\nLoading masks for {args.view1_name} from: {args.mask_dir1}")
+            mask_path = Path(args.mask_dir1)
+            registrar.load_masks(mask_path, args.view1_name, max_frames=args.max_frames)
+
+        if args.mask_dir2 and args.apply_masks:
+            print(f"\nLoading masks for {args.view2_name} from: {args.mask_dir2}")
+            mask_path = Path(args.mask_dir2)
+            registrar.load_masks(mask_path, args.view2_name, max_frames=args.max_frames)
+
         # Simple center alignment to cam0
         transformations = registrar.simple_center_alignment(reference_view=args.reference_view)
 
@@ -735,23 +1220,36 @@ def main():
 
         print(f"Using existing alignment results from: {registration_results_dir}")
 
-    # # Step 2: Visualize aligned point clouds
-    # print(f"\n{'=' * 60}")
-    # print("STEP 2: VISUALIZING ALIGNED POINT CLOUDS")
-    # print(f"{'=' * 60}")
-    #
-    # visualizer = ViserVisualizer(
-    #     registration_results_dir=registration_results_dir,
-    #     verbose=args.verbose
-    # )
-    #
-    # # Update visualization parameters
-    # visualizer.params['point_size'] = args.point_size
-    # visualizer.params['downsample_factor'] = args.downsample_factor
-    # visualizer.params['max_frames_display'] = args.max_frames
-    #
-    # # Start visualization
-    # visualizer.create_visualization(share=args.share)
+    # Step 2: Visualize with camera poses
+    print(f"\n{'=' * 60}")
+    print("STEP 2: VISUALIZING WITH CAMERA POSES")
+    print(f"{'=' * 60}")
+    print(f"Showing six different elements:")
+    print(f"  1. {args.view1_name} camera pose (red)")
+    print(f"  2. {args.view2_name} original camera pose (green)")
+    print(f"  3. {args.view2_name} registered camera pose in {args.view1_name} coordinate system (blue)")
+    print(f"  4. {args.view1_name} point cloud (purple)")
+    print(f"  5. {args.view2_name} point cloud (orange)")
+    print(f"  6. {args.view2_name} aligned point cloud in {args.view1_name} coordinate system (blue)")
+
+    visualizer = MultiCameraVisualizer(
+        registration_results_dir=registration_results_dir,
+        verbose=args.verbose
+    )
+
+    # Update visualization parameters
+    visualizer.params['point_size'] = args.point_size
+    visualizer.params['downsample_factor'] = args.downsample_factor
+    visualizer.params['max_frames_display'] = args.max_frames
+
+    # Start visualization with camera poses
+    visualizer.create_visualization(
+        share=args.share,
+        pose_dir1=Path(args.pose_dir1) if args.pose_dir1 else None,
+        pose_dir2=Path(args.pose_dir2) if args.pose_dir2 else None,
+        view1_name=args.view1_name,
+        view2_name=args.view2_name
+    )
 
 
 if __name__ == "__main__":

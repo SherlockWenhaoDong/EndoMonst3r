@@ -62,20 +62,21 @@ def loss_of_one_batch(batch, model, criterion, device, symmetrize_batch=False, u
         for name in view.keys():  # pseudo_focal
             if name in ignore_keys:
                 continue
-            view[name] = view[name].to(device, non_blocking=True)
+            if isinstance(view[name], torch.Tensor):
+                view[name] = view[name].to(device, non_blocking=True)
 
     if symmetrize_batch:
         view1, view2 = make_batch_symmetric(batch)
 
     with torch.cuda.amp.autocast(enabled=bool(use_amp)):
         pred1, pred2 = model(view1, view2)
-            
+
         # loss is supposed to be symmetric
         with torch.cuda.amp.autocast(enabled=False):
             loss = criterion(view1, view2, pred1, pred2) if criterion is not None else None
 
     result = dict(view1=view1, view2=view2, pred1=pred1, pred2=pred2, loss=loss)
-        
+
     return result[ret] if ret else result
 
 
